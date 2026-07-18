@@ -210,6 +210,8 @@ const BOMB_RADIUS = 90;
 const BOMB_DAMAGE = 10;
 // 出口类触发（恶魔房返回门/楼层活板门）的换房冷却：切换房间后该时长内不响应出口重叠
 const EXIT_GRACE_MS = 600;
+// Boss 清房后活板门延迟开启时长（给玩家捡奖励/走位时间，顺带杜绝"清房瞬间正站在门位被直接下层"）
+const FLOOR_EXIT_OPEN_DELAY_MS = 2500;
 // 实体名 -> 贴图 key（对应 preload 里注册的原版素材）；未列出的实体 kind 与贴图 key 同名
 const SPRITES = {
   player: "isaac",
@@ -1321,7 +1323,6 @@ class BasementScene extends Phaser.Scene {
       cdown: "DOWN",
       cleft: "LEFT",
       cright: "RIGHT",
-      restart: "R",
       action: "SPACE",
       bomb: "E",
       useHeld: "Q",
@@ -1357,7 +1358,7 @@ class BasementScene extends Phaser.Scene {
     this.floor = 1;
     this.runSeed = Number.isFinite(seedParam) && seedParam > 0 ? Math.floor(seedParam) : Phaser.Math.Between(10000, 99999);
     this.rng = new Phaser.Math.RandomDataGenerator([`${this.runSeed}`]);
-    this.seenItems = new Set(); // 目击道具：进房看见过的道具不再进抽取池（scene.restart 时随 create 清空）
+    this.seenItems = new Set(); // 目击道具：进房看见过的道具不再进抽取池（刷新页面重开一局时随 create 清空）
     this.usedBossKinds = new Set(); // 本局已抽过的 Boss，保证每层 Boss 不重样
     this.shopDonated = 0; // 本局捐款机累计金额（每 5¢ 商店升 1 级；不写入存储，重开清零）
     this.donationCollider = null; // 捐款机与玩家的碰撞器（离开商店时随房间销毁并解绑）
@@ -1386,7 +1387,6 @@ class BasementScene extends Phaser.Scene {
     this.gameEnded = false;
     this.isPaused = false;
     this.bigmapVisible = false;
-    this.restartArmedAt = 0; // R 重开确认：第一次按后的 2 秒窗口
     this.runTimeMs = 0; // 游戏内累计时间（暂停/结算时不走），顶部计时显示用
     this.lastTimerSec = -1;
     this.bloodBanner = null; // 当前血带横幅（同时只保留一条）
@@ -2267,6 +2267,15 @@ class BasementScene extends Phaser.Scene {
     if (params.get("pause")) this.togglePause();
     // ?devilroom=1：直接进恶魔房（截图验证恶魔房内装，不走 Boss 门链路）
     if (params.get("devilroom")) this.enterDevilRoom();
+    // ?die=1：1s 后按真实链路致死（结算画面冒烟/截图用）
+    if (params.get("die")) {
+      this.time.delayedCall(1000, () => {
+        this.playerStats.hp = 1;
+        this.playerStats.soulHp = 0;
+        this.invulnerableUntil = 0;
+        this.damagePlayer(1);
+      });
+    }
   }
 
   // 冒烟断言（?smoke=1 触发）：20 个种子 × 3 层地图 + 全部模板自检，
@@ -2488,6 +2497,10 @@ class BasementScene extends Phaser.Scene {
     pre.textContent = [summary, ...failures].join("\n");
     document.body.appendChild(pre);
     document.title = failures.length ? "SMOKE FAIL" : "SMOKE PASS";
+    // 无头冒烟回报通道：dump 类抓取发生在 load 事件（早于报告写好），结果改经 fetch 落进本地服务器日志
+    try {
+      fetch(`/__report__?tag=map&title=${encodeURIComponent(document.title + "：" + summary)}&fails=${failures.length}`);
+    } catch (err) { /* 非服务器环境忽略 */ }
     // 怪物行为模拟（smokeEnemySim）结束后会回填这份报告
     this.smokeReport = { failures, pre };
   }
@@ -2553,7 +2566,43 @@ class BasementScene extends Phaser.Scene {
       };
       this.rooms.set("6,6", bossRoom);
       this.spawnBossReward(bossRoom, true);
-      check(bossRoom.devilDoor === "north", `无邻居 Boss 房恶魔门应为北墙幽灵门，实际 ${bossRoom.devilDoor}`);
+      check(bossRoom.devilDoor === "east", `无邻居 Boss 房恶魔门应为东墙幽灵门（北墙禁用），实际 ${bossRoom.devilDoor}`);
+      check(this.floorExits.getChildren().length === 0, "刚清房时应延迟落活板门（不应同步出现）");
+      this.spawnFloorExit(bossRoom); // 模拟 FLOOR_EXIT_OPEN_DELAY_MS 到点（冒烟不走真实定时器）
+      // 6b) 楼层活板门触发圈必须与可视图案同心（回归：setCircle(80,48,56) 曾把圆心甩到图案右下 90/107px，踩门不下层）
+      const floorExitBody = this.floorExits.getChildren()[0];
+      // 冒烟在 spawn 同一帧调用栈内读数：body 尚未跑过 preUpdate 同步，需手动同步一次（实际游玩由引擎逐帧同步）
+      if (floorExitBody) floorExitBody.body.updateFromGameObject();
+      const exitVec = floorExitBody
+        ? [floorExitBody.body.center.x - floorExitBody.x, floorExitBody.body.center.y - floorExitBody.y]
+        : [999, 999];
+      const exitOff = Math.hypot(exitVec[0], exitVec[1]);
+      check(
+        exitOff < 6,
+        `活板门触发圈应居中于可视图案，实际偏移 (${exitVec[0].toFixed(1)},${exitVec[1].toFixed(1)})px` +
+          (floorExitBody ? `，body=(${floorExitBody.body.x.toFixed(1)},${floorExitBody.body.y.toFixed(1)}) r=${floorExitBody.body.radius} sprite=(${floorExitBody.x},${floorExitBody.y}) w=${floorExitBody.width}x${floorExitBody.height}` : "（无活板门）"),
+      );
+      // 6d) 活板门防误触 + 真实下层全链路：未 armed（Boss 死瞬间正踩着触发区）→ 拒下层；armed 后再踩 → finishFloor 换层
+      this.current = { x: 6, y: 6 };
+      const savedRoomsAll = this.rooms;
+      const savedEntered = this.enteredRooms;
+      const savedClearedSet = this.clearedRooms;
+      const savedActiveKey = this.activeRoomKey;
+      const floorBefore = this.floor;
+      this.floor = 1; // 防 ?floor=3 起冒烟时 finishFloor 走进 winRun 分支
+      this.lastMoveAt = 0;
+      check(floorExitBody && floorExitBody.armed === false, "活板门生成时应为 armed=false");
+      this.enterFloorExit(this.player, floorExitBody);
+      check(this.floor === 1, "未 armed 时踩活板门不应下层");
+      floorExitBody.armed = true; // 模拟玩家先离开过触发区一次（updateExitArming 置位路径）
+      this.enterFloorExit(this.player, floorExitBody);
+      check(this.floor === 2, "armed 后踩活板门应下层（finishFloor 未触发）");
+      // 现场恢复：finishFloor 重建了整层地图/集合，换回冒烟前现场
+      this.floor = floorBefore;
+      this.rooms = savedRoomsAll;
+      this.enteredRooms = savedEntered;
+      this.clearedRooms = savedClearedSet;
+      this.activeRoomKey = savedActiveKey;
       // 直调 spawnBossReward 落出的奖励拾取物是副作用，切房前清掉（不留在起始房 groundDrops）
       this.pickups.clear(true, true);
       this.floorExits.clear(true, true);
@@ -2562,6 +2611,29 @@ class BasementScene extends Phaser.Scene {
       const devilDoorG = this.doorGraphics.find((g) => g.doorKind === "devil");
       check(Boolean(devilDoorG), "drawDoors 未渲染恶魔门");
       check(devilDoorG && devilDoorG.doorTexture === "devilDoor", "恶魔门未走 devilDoor 官方贴图路径");
+
+      // 6c) 恶魔门防误触全链路：门刚刷出(armed=false)玩家压在门口线 → 不进；退回房内一次(armed 置位)→ 再越线才进
+      const savedRngDevil = this.rng;
+      const devilRect = this.roomRect(bossRoom);
+      const crossSpot = {
+        north: [devilRect.cx, devilRect.top - 8],
+        south: [devilRect.cx, devilRect.bottom + 8],
+        west: [devilRect.left - 8, devilRect.cy],
+        east: [devilRect.right + 8, devilRect.cy],
+      }[bossRoom.devilDoor];
+      this.lastMoveAt = 0; // 跳过换房冷却，直达判定本体
+      this.player.setPosition(crossSpot[0], crossSpot[1]);
+      this.tryDoorTransition(this.time.now + 10000);
+      check(this.current.x !== 9, "恶魔门刚刷出、玩家恰压门口线时不应被吸入");
+      check(bossRoom.devilDoorArmed === false, "越线被拒时 devilDoorArmed 应保持 false");
+      this.player.setPosition(devilRect.cx, devilRect.cy);
+      this.tryDoorTransition(this.time.now + 10001);
+      check(bossRoom.devilDoorArmed === true, "玩家完整站回房内一次后应置位 devilDoorArmed");
+      this.player.setPosition(crossSpot[0], crossSpot[1]);
+      this.tryDoorTransition(this.time.now + 10002);
+      check(this.current.x === 9 && this.current.y === 9, "armed 后越过恶魔门线应进恶魔房");
+      if (this.current.x === 9) this.leaveDevilRoom(); // 回到 6,6；恶魔房离屏房随之删除
+      this.rng = savedRngDevil;
       // 拆除假房：清掉它带出的商品/出口拾取物，回起始房重绘
       this.pickups.clear(true, true);
       this.floorExits.clear(true, true);
@@ -2719,6 +2791,11 @@ class BasementScene extends Phaser.Scene {
       : `SMOKE PASS：模板自检 + 20 种子 × 3 层地图/多尺寸房/门槽断言 + 商店/隐藏房/恶魔门/交易断言 + 怪物贴图/行为模拟全部通过`;
     pre.textContent = [summary, simNote, ...failures].filter(Boolean).join("\n");
     document.title = failures.length ? "SMOKE FAIL" : "SMOKE PASS";
+    // 无头冒烟回报通道（同上 fetch 落服务器日志）；detail 带前 1200 字节失败明细
+    try {
+      const detail = encodeURIComponent(failures.join(" | ").slice(0, 1200));
+      fetch(`/__report__?tag=full&title=${encodeURIComponent(document.title)}&fails=${failures.length}&detail=${detail}`);
+    } catch (err) { /* 非服务器环境忽略 */ }
   }
 
   // 模板库自检：尺寸、进房格/中心格留空、可通行连通性（敌人标记格视为可走）；
@@ -3853,15 +3930,17 @@ class BasementScene extends Phaser.Scene {
     [-1, 1].forEach((side) => this.placeObstacle("candle", ROOM.cx + side * 64, ROOM.top + 58, this.rng, true));
   }
 
-  // 可被恶魔门借用的门洞方向：有真实邻居、非未揭示隐藏房、非锁门；返回方向 label 数组
+  // 可被恶魔门借用的门洞方向：有真实邻居、非未揭示隐藏房、非锁门；北墙（上方）禁用——
+  // 玩家最常南北向走动（进 Boss 房多从南门进、下层活板门也在中间偏上），北墙红门极易误进
   devilDoorCandidates(room) {
     return [
-      { dx: 0, dy: -1, label: "north" },
+      { dx: 0, dy: -1, label: "north", banned: true },
       { dx: 0, dy: 1, label: "south" },
       { dx: -1, dy: 0, label: "west" },
       { dx: 1, dy: 0, label: "east" },
     ]
-      .filter(({ dx, dy }) => {
+      .filter(({ dx, dy, banned }) => {
+        if (banned) return false;
         const target = this.rooms.get(`${room.x + dx},${room.y + dy}`);
         if (!target) return false;
         if (SECRET_TYPES.has(target.type) && !target.revealed) return false;
@@ -3872,37 +3951,59 @@ class BasementScene extends Phaser.Scene {
   }
 
   spawnBossReward(room, forceDevil = false) {
-    if (!room.bossRewardReady) {
+    const freshClear = !room.bossRewardReady; // 本次清房后首次发奖（区别于重进房 drawRoom 的重放）
+    if (freshClear) {
       room.bossRewardReady = true;
       room.item = this.pickFromPool(ITEM_POOL);
       this.spawnPickup("soulHeart", ROOM.cx - 74, ROOM.cy - 48);
       for (let i = 0; i < 4; i += 1) {
         this.spawnPickup("coin", ROOM.cx - 120 + i * 24, ROOM.cy + 52);
       }
-      // 恶魔门（概率 40%+每层 8%）：Boss 房一面有连接的门洞标记为红门；
-      // 没有合格邻居门时退化为北墙"幽灵门"。本层内持久，换层随 buildMap 重摇清空
+      // 恶魔门（概率 40%+每层 8%）：Boss 房一面有连接的门洞标记为红门（北墙禁用，见 devilDoorCandidates）；
+      // 没有合格邻居门时退化为东墙"幽灵门"。本层内持久，换层随 buildMap 重摇清空
       const forced = forceDevil || new URLSearchParams(location.search).get("devil");
       if (forced || this.rng.frac() < 0.4 + this.floor * 0.08) {
         const candidates = this.devilDoorCandidates(room);
-        room.devilDoor = candidates.length ? this.rng.pick(candidates) : "north";
+        room.devilDoor = candidates.length ? this.rng.pick(candidates) : "east";
+        room.devilDoorArmed = false; // 防误触：门出现后须先观察到玩家完整站在房内一次才响应越线（见 tryDoorTransition）
       }
     }
     this.spawnItemPedestal(room);
-    this.spawnFloorExit(room);
+    // 下层通道延迟开启：刚清房的那次延迟 FLOOR_EXIT_OPEN_DELAY_MS 才落活板门并 toast 提示
+    // （给玩家捡奖励/走位时间；armed 机制兜底，门落在玩家正脚下也不会被直接下层）；
+    // 已清理房重进（drawRoom，含恶魔房返回/传送）立即落位，画面自洽
+    if (freshClear) this.scheduleFloorExit(room, FLOOR_EXIT_OPEN_DELAY_MS);
+    else this.spawnFloorExit(room);
+  }
+
+  // 活板门落位调度：延迟路径经场景定时器落位——仅玩家仍在本房才落（离开则改由下次进房 drawRoom 走立即路径）；
+  // 同帧已有活板门时跳过，防极端时序重复落位
+  scheduleFloorExit(room, delayMs) {
+    this.time.delayedCall(delayMs, () => {
+      if (this.getRoom() !== room) return;
+      if (this.floorExits.getChildren().length > 0) return;
+      this.spawnFloorExit(room);
+      this.showToast("通往下一层的入口打开了");
+      SFX.play("door");
+    });
   }
 
   spawnFloorExit(room) {
-    const exit = this.physics.add.sprite(ROOM.cx, ROOM.cy + 126, "floorExit");
+    // 位置：房间中间偏上——远离南门洞，杜绝玩家出房时贴身误触；与中央道具底座（cy±12）上下错开
+    const exit = this.physics.add.sprite(ROOM.cx, ROOM.cy - 88, "floorExit");
     exit.kind = "floorExit";
     exit.room = room;
     exit.armed = false; // 防误触：玩家须先离开过触发区一次（见 updateExitArming）
-    exit.setDisplaySize(72, 54);
+    // 不做缩放（直接用 76×58 原帧）：scale=1 时 body 偏移语义无歧义，触发圈才能精确居中
     exit.setDepth(DEPTH.pickup - 2);
     this.floorExits.add(exit);
-    exit.body.setCircle(80, 48, 56);
+    // 触发圈贴合可视活板门且对中：offset = 帧中心(38,29) − 半径（帧 76×58），踩在图案上才触发；
+    // 配合上方 armed=false + updateExitArming,门生成瞬间玩家即使正站在生成点上也不会被直接下层，
+    // 须先走出触发区一次（armed 置位），再踩上来才生效
+    exit.body.setCircle(32, 38 - 32, 29 - 32);
 
     const label = this.add
-      .text(ROOM.cx, ROOM.cy + 162, this.floor >= MAX_FLOOR ? "离开地窖" : "下一层", {
+      .text(ROOM.cx, ROOM.cy - 52, this.floor >= MAX_FLOOR ? "离开地窖" : "下一层", {
         fontFamily: "Arial, sans-serif",
         fontSize: "18px",
         color: "#fff0c6",
@@ -4837,17 +4938,6 @@ class BasementScene extends Phaser.Scene {
     this.showToast(SFX.muted ? "已静音（按 M 恢复）" : "声音已恢复");
   }
 
-  // R 重开需 2 秒内连按两次确认，防误触；结算画面直接重开
-  tryRestart(time) {
-    if (this.gameEnded || time < this.restartArmedAt) {
-      this.scene.restart();
-      return true;
-    }
-    this.restartArmedAt = time + 2000;
-    this.showToast("再按 R 确认重开");
-    return false;
-  }
-
   // 与当前房相邻（大房按全部占格任一相接即邻，含自身）
   nearCurrent(room) {
     const cur = this.getRoom();
@@ -4860,9 +4950,6 @@ class BasementScene extends Phaser.Scene {
   }
 
   update(time, delta) {
-    if (Phaser.Input.Keyboard.JustDown(this.keys.restart)) {
-      if (this.tryRestart(time)) return;
-    }
     if (Phaser.Input.Keyboard.JustDown(this.keys.pause) || Phaser.Input.Keyboard.JustDown(this.keys.pauseAlt)) {
       this.togglePause();
     }
@@ -4912,7 +4999,7 @@ class BasementScene extends Phaser.Scene {
     if (!force && !coarse) return;
 
     controls.hidden = false;
-    // scene.restart 会重跑 create，但场景实例不变、DOM 也只绑一次
+    // 重开已改为刷新页面，create 每局只跑一次；touchBound 仍留作防重复绑定兜底
     if (this.touchBound) return;
     this.touchBound = true;
 
@@ -5592,7 +5679,7 @@ class BasementScene extends Phaser.Scene {
       this.clearedRooms.add(`${room.x},${room.y}`);
       if (room.type === "boss") {
         this.chargeActive(1);
-        this.showToast("Boss 掉落了道具，通往下一层的入口打开了");
+        this.showToast("Boss 掉落了道具"); // 下层通道 FLOOR_EXIT_OPEN_DELAY_MS 后开启，届时另有提示（见 scheduleFloorExit）
         SFX.play("clear");
         SFX.play("door");
         this.drawRoom();
@@ -6860,6 +6947,9 @@ class BasementScene extends Phaser.Scene {
     else if (this.player.x < rect.left - 4) crossing = "west";
     else if (this.player.x > rect.right + 4) crossing = "east";
     if (!crossing) {
+      // 恶魔门防误触的 armed 置位：玩家完整站在房内（未越任何墙线）时置位——
+      // 恶魔门刷出瞬间玩家恰压在门口线上不会被吸入（与楼层活板门同一套语义）
+      if (room.devilDoor && !room.devilDoorArmed) room.devilDoorArmed = true;
       this.keepInRoom(this.player);
       return;
     }
@@ -6871,6 +6961,11 @@ class BasementScene extends Phaser.Scene {
 
     // 恶魔门：Boss 房开出的红门（含无真实邻居的幽灵门），走进去直达恶魔房（离屏 9,9）
     if (room.devilDoor === crossing) {
+      // 门出现后玩家还没被观察到站回房内（如 Boss 死时正压在门口）：不触发，先推回房内
+      if (!room.devilDoorArmed) {
+        this.keepInRoom(this.player);
+        return;
+      }
       const behind = this.rooms.get(`${slot.nx},${slot.ny}`);
       if (behind && SECRET_TYPES.has(behind.type) && !behind.revealed) {
         this.keepInRoom(this.player);
@@ -7094,7 +7189,7 @@ class BasementScene extends Phaser.Scene {
     this.gameEnded = true;
     this.player.body.setVelocity(0, 0);
     this.stopPlayerWalk();
-    this.showEndCard("你逃出了地窖", "按 R 重新开始");
+    this.showEndCard("你逃出了地窖", "刷新页面重新开始");
   }
 
   loseRun() {
@@ -7102,7 +7197,7 @@ class BasementScene extends Phaser.Scene {
     this.player.body.setVelocity(0, 0);
     this.stopPlayerWalk();
     this.player.setTint(0x333333);
-    this.showEndCard("你倒在了地窖里", "按 R 再试一次");
+    this.showEndCard("你倒在了地窖里", "刷新页面再试一次");
   }
 
   showEndCard(title, subtitle) {
