@@ -1332,6 +1332,9 @@ class BasementScene extends Phaser.Scene {
     });
     this.input.keyboard.addCapture("TAB"); // 阻止 Tab 触发浏览器焦点切换
 
+    this.touchTaps = Object.create(null); // 触屏一次性按键队列（主动/药丸/炸弹）
+    this.setupTouchControls();
+
     this.input.keyboard.on("keydown", () => {
       SFX.ensure();
       MUSIC.start();
@@ -4803,6 +4806,7 @@ class BasementScene extends Phaser.Scene {
   // Esc/P 暂停：物理暂停 + 遮罩，暂停时音乐停、只响应暂停键与 R
   togglePause() {
     if (this.gameEnded) return;
+    this.touchTaps = Object.create(null); // 暂停期间不缓存触屏按键，避免恢复后误触发
     this.isPaused = !this.isPaused;
     this.pauseVeil.bg.setVisible(this.isPaused);
     this.pauseVeil.label.setVisible(this.isPaused);
@@ -4894,6 +4898,116 @@ class BasementScene extends Phaser.Scene {
     this.cleanProjectiles();
     this.updateHudEffects(time);
     this.updateItemCard();
+  }
+
+  // ---------- 触屏虚拟控件 ----------
+  // 触屏设备（或 ?touch=1 桌面调试）显示 DOM 双摇杆 + 主动/药丸/炸弹/暂停按钮。
+  // 摇杆把方向直接写进 keys.*.isDown（与 ?ff 快进同一路径，frame 轮询天然兼容）；
+  // 一次性按键走 touchTaps 队列，由 tryUseActiveItem/tryUseHeld/tryPlaceBomb 消费。
+  setupTouchControls() {
+    const controls = document.getElementById("touch-controls");
+    if (!controls) return;
+    const force = new URLSearchParams(location.search).get("touch");
+    const coarse = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+    if (!force && !coarse) return;
+
+    controls.hidden = false;
+    // scene.restart 会重跑 create，但场景实例不变、DOM 也只绑一次
+    if (this.touchBound) return;
+    this.touchBound = true;
+
+    // 控件上的首次触摸也要解锁音频（canvas 的 pointerdown 监听收不到 DOM 事件）
+    controls.addEventListener(
+      "pointerdown",
+      () => {
+        SFX.ensure();
+        MUSIC.start();
+      },
+      true,
+    );
+    controls.addEventListener("contextmenu", (ev) => ev.preventDefault());
+
+    this.bindStick(document.getElementById("stick-move"), { up: "up", down: "down", left: "left", right: "right" });
+    this.bindStick(document.getElementById("stick-fire"), { up: "cup", down: "cdown", left: "cleft", right: "cright" });
+    const bindTap = (id, name) => {
+      document.getElementById(id).addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        this.queueTap(name);
+      });
+    };
+    bindTap("tb-active", "action");
+    bindTap("tb-held", "held");
+    bindTap("tb-bomb", "bomb");
+    document.getElementById("tb-pause").addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      this.togglePause();
+    });
+  }
+
+  // 固定式摇杆：按下后跟踪单一 pointerId 的位移，超过死区即置对应方向键
+  bindStick(base, keyMap) {
+    if (!base) return;
+    const knob = base.querySelector(".stick-knob");
+    const held = { up: false, down: false, left: false, right: false };
+    let pid = null;
+
+    const apply = (ev) => {
+      const rect = base.getBoundingClientRect();
+      const dx = ev.clientX - (rect.left + rect.width / 2);
+      const dy = ev.clientY - (rect.top + rect.height / 2);
+      const dead = rect.width * 0.14;
+      const next = {
+        left: dx < -dead,
+        right: dx > dead,
+        up: dy < -dead,
+        down: dy > dead,
+      };
+      Object.keys(next).forEach((dir) => {
+        if (next[dir] === held[dir]) return;
+        held[dir] = next[dir];
+        this.keys[keyMap[dir]].isDown = next[dir];
+      });
+      // 摇杆头视觉：限位在半径 32% 内
+      const max = rect.width * 0.32;
+      const len = Math.hypot(dx, dy) || 1;
+      const k = Math.min(len, max) / len;
+      knob.style.transform = `translate(${dx * k}px, ${dy * k}px)`;
+    };
+
+    const reset = () => {
+      Object.keys(held).forEach((dir) => {
+        if (!held[dir]) return;
+        held[dir] = false;
+        this.keys[keyMap[dir]].isDown = false;
+      });
+      knob.style.transform = "";
+      pid = null;
+    };
+
+    base.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      pid = ev.pointerId;
+      base.setPointerCapture(pid);
+      apply(ev);
+    });
+    base.addEventListener("pointermove", (ev) => {
+      if (ev.pointerId === pid) apply(ev);
+    });
+    ["pointerup", "pointercancel", "lostpointercapture"].forEach((type) =>
+      base.addEventListener(type, (ev) => {
+        if (ev.pointerId === pid) reset();
+      }),
+    );
+  }
+
+  queueTap(name) {
+    this.touchTaps[name] = true;
+  }
+
+  consumeTap(name) {
+    if (!this.touchTaps || !this.touchTaps[name]) return false;
+    this.touchTaps[name] = false;
+    return true;
   }
 
   handleMovement() {
@@ -5064,7 +5178,7 @@ class BasementScene extends Phaser.Scene {
   }
 
   tryUseActiveItem() {
-    if (!Phaser.Input.Keyboard.JustDown(this.keys.action)) return;
+    if (!Phaser.Input.Keyboard.JustDown(this.keys.action) && !this.consumeTap("action")) return;
     const item = this.playerStats.activeItem;
     if (!item) {
       this.showToast("还没有主动道具");
@@ -5096,7 +5210,7 @@ class BasementScene extends Phaser.Scene {
 
   // Q 使用持有物（药丸/卡牌共用一个槽位）
   tryUseHeld() {
-    if (!Phaser.Input.Keyboard.JustDown(this.keys.useHeld)) return;
+    if (!Phaser.Input.Keyboard.JustDown(this.keys.useHeld) && !this.consumeTap("held")) return;
     this.useHeldItem();
   }
 
@@ -5197,7 +5311,7 @@ class BasementScene extends Phaser.Scene {
   }
 
   tryPlaceBomb() {
-    if (!Phaser.Input.Keyboard.JustDown(this.keys.bomb)) return;
+    if (!Phaser.Input.Keyboard.JustDown(this.keys.bomb) && !this.consumeTap("bomb")) return;
     if (this.playerStats.bombs <= 0) {
       this.showToast("没有炸弹了");
       return;

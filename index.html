@@ -2,10 +2,10 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
     <title>地窖泪弹</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="./styles.css?v=20260715" />
+    <link rel="stylesheet" href="./styles.css?v=20260718" />
   </head>
   <body>
     <main class="shell">
@@ -14,8 +14,32 @@
       </section>
     </main>
 
+    <!-- 竖屏时提示旋转（仅触屏设备显示，样式由 styles.css 控制） -->
+    <div id="rotate-hint" aria-hidden="true">⟳ 请旋转手机，横屏游玩</div>
+
+    <!-- 触屏虚拟控件：左移动摇杆 / 右射击摇杆 / 主动·药丸（卡牌）·炸弹 按钮。
+         默认隐藏，game.js 检测到触屏设备（或 ?touch=1）时移除 hidden 并接线。 -->
+    <div id="touch-controls" hidden>
+      <div class="stick stick-move" id="stick-move">
+        <div class="stick-ring"></div>
+        <div class="stick-knob"></div>
+        <span class="stick-label">移动</span>
+      </div>
+      <div class="stick stick-fire" id="stick-fire">
+        <div class="stick-ring"></div>
+        <div class="stick-knob"></div>
+        <span class="stick-label">射击</span>
+      </div>
+      <div class="touch-actions">
+        <button class="touch-btn" id="tb-active" type="button">主动</button>
+        <button class="touch-btn" id="tb-held" type="button">药丸</button>
+        <button class="touch-btn" id="tb-bomb" type="button">炸弹</button>
+      </div>
+      <button class="touch-btn touch-pause" id="tb-pause" type="button">Ⅱ</button>
+    </div>
+
     <script src="./phaser.min.js?v=3.90.0"></script>
     <script src="./assets-data.js?v=20260717"></script>
-    <script src="./game.js?v=20260717"></script>
+    <script src="./game.js?v=20260718"></script>
   </body>
 </html>
